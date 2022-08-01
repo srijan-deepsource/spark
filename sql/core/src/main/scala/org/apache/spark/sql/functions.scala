@@ -113,7 +113,17 @@ object functions {
    * @group normal_funcs
    * @since 1.3.0
    */
-  def lit(literal: Any): Column = typedLit(literal)
+  def lit(literal: Any): Column = literal match {
+    case c: Column => c
+    case s: Symbol => new ColumnName(s.name)
+    case _ =>
+      // This is different from `typedlit`. `typedlit` calls `Literal.create` to use
+      // `ScalaReflection` to get the type of `literal`. However, since we use `Any` in this method,
+      // `typedLit[Any](literal)` will always fail and fallback to `Literal.apply`. Hence, we can
+      // just manually call `Literal.apply` to skip the expensive `ScalaReflection` code. This is
+      // significantly better when there are many threads calling `lit` concurrently.
+      Column(Literal(literal))
+  }
 
   /**
    * Creates a [[Column]] of literal value.
@@ -133,6 +143,9 @@ object functions {
    * Otherwise, a new [[Column]] is created to represent the literal value.
    * The difference between this function and [[lit]] is that this function
    * can handle parameterized scala types e.g.: List, Seq and Map.
+   *
+   * @note `typedlit` will call expensive Scala reflection APIs. `lit` is preferred if parameterized
+   * Scala types are not used.
    *
    * @group normal_funcs
    * @since 3.2.0
@@ -674,6 +687,14 @@ object functions {
   def max(columnName: String): Column = max(Column(columnName))
 
   /**
+   * Aggregate function: returns the value associated with the maximum value of ord.
+   *
+   * @group agg_funcs
+   * @since 3.3.0
+   */
+  def max_by(e: Column, ord: Column): Column = withAggregateFunction { MaxBy(e.expr, ord.expr) }
+
+  /**
    * Aggregate function: returns the average of the values in a group.
    * Alias for avg.
    *
@@ -706,6 +727,14 @@ object functions {
    * @since 1.3.0
    */
   def min(columnName: String): Column = min(Column(columnName))
+
+  /**
+   * Aggregate function: returns the value associated with the minimum value of ord.
+   *
+   * @group agg_funcs
+   * @since 3.3.0
+   */
+  def min_by(e: Column, ord: Column): Column = withAggregateFunction { MinBy(e.expr, ord.expr) }
 
   /**
    * Aggregate function: returns the approximate `percentile` of the numeric column `col` which
@@ -1739,15 +1768,27 @@ object functions {
   def cbrt(columnName: String): Column = cbrt(Column(columnName))
 
   /**
-   * Computes the ceiling of the given value.
+   * Computes the ceiling of the given value of `e` to `scale` decimal places.
+   *
+   * @group math_funcs
+   * @since 3.3.0
+   */
+  def ceil(e: Column, scale: Column): Column = withExpr {
+    UnresolvedFunction(Seq("ceil"), Seq(e.expr, scale.expr), isDistinct = false)
+  }
+
+  /**
+   * Computes the ceiling of the given value of `e` to 0 decimal places.
    *
    * @group math_funcs
    * @since 1.4.0
    */
-  def ceil(e: Column): Column = withExpr { Ceil(e.expr) }
+  def ceil(e: Column): Column = withExpr {
+    UnresolvedFunction(Seq("ceil"), Seq(e.expr), isDistinct = false)
+  }
 
   /**
-   * Computes the ceiling of the given column.
+   * Computes the ceiling of the given value of `e` to 0 decimal places.
    *
    * @group math_funcs
    * @since 1.4.0
@@ -1801,6 +1842,24 @@ object functions {
   def cosh(columnName: String): Column = cosh(Column(columnName))
 
   /**
+   * @param e angle in radians
+   * @return cotangent of the angle
+   *
+   * @group math_funcs
+   * @since 3.3.0
+   */
+  def cot(e: Column): Column = withExpr { Cot(e.expr) }
+
+  /**
+   * @param e angle in radians
+   * @return cosecant of the angle
+   *
+   * @group math_funcs
+   * @since 3.3.0
+   */
+  def csc(e: Column): Column = withExpr { Csc(e.expr) }
+
+  /**
    * Computes the exponential of the given value.
    *
    * @group math_funcs
@@ -1841,15 +1900,27 @@ object functions {
   def factorial(e: Column): Column = withExpr { Factorial(e.expr) }
 
   /**
-   * Computes the floor of the given value.
+   * Computes the floor of the given value of `e` to `scale` decimal places.
+   *
+   * @group math_funcs
+   * @since 3.3.0
+   */
+  def floor(e: Column, scale: Column): Column = withExpr {
+    UnresolvedFunction(Seq("floor"), Seq(e.expr, scale.expr), isDistinct = false)
+  }
+
+  /**
+   * Computes the floor of the given value of `e` to 0 decimal places.
    *
    * @group math_funcs
    * @since 1.4.0
    */
-  def floor(e: Column): Column = withExpr { Floor(e.expr) }
+  def floor(e: Column): Column = withExpr {
+    UnresolvedFunction(Seq("floor"), Seq(e.expr), isDistinct = false)
+  }
 
   /**
-   * Computes the floor of the given column.
+   * Computes the floor of the given column value to 0 decimal places.
    *
    * @group math_funcs
    * @since 1.4.0
@@ -2187,6 +2258,15 @@ object functions {
    * @since 2.0.0
    */
   def bround(e: Column, scale: Int): Column = withExpr { BRound(e.expr, Literal(scale)) }
+
+  /**
+   * @param e angle in radians
+   * @return secant of the angle
+   *
+   * @group math_funcs
+   * @since 3.3.0
+   */
+  def sec(e: Column): Column = withExpr { Sec(e.expr) }
 
   /**
    * Shift the given value numBits left. If the given value is a long value, this function
@@ -2533,6 +2613,14 @@ object functions {
   def base64(e: Column): Column = withExpr { Base64(e.expr) }
 
   /**
+   * Calculates the bit length for the specified string column.
+   *
+   * @group string_funcs
+   * @since 3.3.0
+   */
+  def bit_length(e: Column): Column = withExpr { BitLength(e.expr) }
+
+  /**
    * Concatenates multiple input string columns together into a single string column,
    * using the given separator.
    *
@@ -2681,6 +2769,17 @@ object functions {
   }
 
   /**
+   * Left-pad the binary column with pad to a byte length of len. If the binary column is longer
+   * than len, the return value is shortened to len bytes.
+   *
+   * @group string_funcs
+   * @since 3.3.0
+   */
+  def lpad(str: Column, len: Int, pad: Array[Byte]): Column = withExpr {
+    UnresolvedFunction("lpad", Seq(str.expr, lit(len).expr, lit(pad).expr), isDistinct = false)
+  }
+
+  /**
    * Trim the spaces from left end for the specified string value.
    *
    * @group string_funcs
@@ -2696,6 +2795,14 @@ object functions {
   def ltrim(e: Column, trimString: String): Column = withExpr {
     StringTrimLeft(e.expr, Literal(trimString))
   }
+
+  /**
+   * Calculates the byte length for the specified string column.
+   *
+   * @group string_funcs
+   * @since 3.3.0
+   */
+  def octet_length(e: Column): Column = withExpr { OctetLength(e.expr) }
 
   /**
    * Extract a specific group matched by a Java regex, from the specified string column.
@@ -2748,6 +2855,17 @@ object functions {
    */
   def rpad(str: Column, len: Int, pad: String): Column = withExpr {
     StringRPad(str.expr, lit(len).expr, lit(pad).expr)
+  }
+
+  /**
+   * Right-pad the binary column with pad to a byte length of len. If the binary column is longer
+   * than len, the return value is shortened to len bytes.
+   *
+   * @group string_funcs
+   * @since 3.3.0
+   */
+  def rpad(str: Column, len: Int, pad: Array[Byte]): Column = withExpr {
+    UnresolvedFunction("rpad", Seq(str.expr, lit(len).expr, lit(pad).expr), isDistinct = false)
   }
 
   /**
@@ -3155,6 +3273,15 @@ object functions {
   def minute(e: Column): Column = withExpr { Minute(e.expr) }
 
   /**
+   * @return A date created from year, month and day fields.
+   * @group datetime_funcs
+   * @since 3.3.0
+   */
+  def make_date(year: Column, month: Column, day: Column): Column = withExpr {
+    MakeDate(year.expr, month.expr, day.expr)
+  }
+
+  /**
    * Returns number of months between dates `start` and `end`.
    *
    * A whole number is returned if both inputs have the same day of month or both are the last day
@@ -3518,7 +3645,7 @@ object functions {
    * processing time.
    *
    * @param timeColumn The column or the expression to use as the timestamp for windowing by time.
-   *                   The time column must be of TimestampType.
+   *                   The time column must be of TimestampType or TimestampNTZType.
    * @param windowDuration A string specifying the width of the window, e.g. `10 minutes`,
    *                       `1 second`. Check `org.apache.spark.unsafe.types.CalendarInterval` for
    *                       valid duration identifiers. Note that the duration is a fixed length of
@@ -3574,7 +3701,7 @@ object functions {
    * processing time.
    *
    * @param timeColumn The column or the expression to use as the timestamp for windowing by time.
-   *                   The time column must be of TimestampType.
+   *                   The time column must be of TimestampType or TimestampNTZType.
    * @param windowDuration A string specifying the width of the window, e.g. `10 minutes`,
    *                       `1 second`. Check `org.apache.spark.unsafe.types.CalendarInterval` for
    *                       valid duration identifiers. Note that the duration is a fixed length of
@@ -3619,7 +3746,7 @@ object functions {
    * processing time.
    *
    * @param timeColumn The column or the expression to use as the timestamp for windowing by time.
-   *                   The time column must be of TimestampType.
+   *                   The time column must be of TimestampType or TimestampNTZType.
    * @param windowDuration A string specifying the width of the window, e.g. `10 minutes`,
    *                       `1 second`. Check `org.apache.spark.unsafe.types.CalendarInterval` for
    *                       valid duration identifiers.
@@ -3647,7 +3774,7 @@ object functions {
    * processing time.
    *
    * @param timeColumn The column or the expression to use as the timestamp for windowing by time.
-   *                   The time column must be of TimestampType.
+   *                   The time column must be of TimestampType or TimestampNTZType.
    * @param gapDuration A string specifying the timeout of the session, e.g. `10 minutes`,
    *                    `1 second`. Check `org.apache.spark.unsafe.types.CalendarInterval` for
    *                    valid duration identifiers.
@@ -3684,7 +3811,7 @@ object functions {
    * processing time.
    *
    * @param timeColumn The column or the expression to use as the timestamp for windowing by time.
-   *                   The time column must be of TimestampType.
+   *                   The time column must be of TimestampType or TimestampNTZType.
    * @param gapDuration A column specifying the timeout of the session. It could be static value,
    *                    e.g. `10 minutes`, `1 second`, or an expression/UDF that specifies gap
    *                    duration dynamically based on the input row.
@@ -3699,7 +3826,8 @@ object functions {
   }
 
   /**
-   * Creates timestamp from the number of seconds since UTC epoch.
+   * Converts the number of seconds from the Unix epoch (1970-01-01T00:00:00Z)
+   * to a timestamp.
    * @group datetime_funcs
    * @since 3.1.0
    */
@@ -3816,6 +3944,7 @@ object functions {
 
   /**
    * Sorts the input array in ascending order. The elements of the input array must be orderable.
+   * NaN is greater than any non-NaN elements for double/float type.
    * Null elements will be placed at the end of the returned array.
    *
    * @group collection_funcs
@@ -4525,8 +4654,9 @@ object functions {
 
   /**
    * Sorts the input array for the given column in ascending or descending order,
-   * according to the natural ordering of the array elements.
-   * Null elements will be placed at the beginning of the returned array in ascending order or
+   * according to the natural ordering of the array elements. NaN is greater than any non-NaN
+   * elements for double/float type. Null elements will be placed at the beginning of the returned
+   * array in ascending order or
    * at the end of the returned array in descending order.
    *
    * @group collection_funcs
@@ -4535,7 +4665,8 @@ object functions {
   def sort_array(e: Column, asc: Boolean): Column = withExpr { SortArray(e.expr, lit(asc).expr) }
 
   /**
-   * Returns the minimum value in the array.
+   * Returns the minimum value in the array. NaN is greater than any non-NaN elements for
+   * double/float type. NULL elements are skipped.
    *
    * @group collection_funcs
    * @since 2.4.0
@@ -4543,7 +4674,8 @@ object functions {
   def array_min(e: Column): Column = withExpr { ArrayMin(e.expr) }
 
   /**
-   * Returns the maximum value in the array.
+   * Returns the maximum value in the array. NaN is greater than any non-NaN elements for
+   * double/float type. NULL elements are skipped.
    *
    * @group collection_funcs
    * @since 2.4.0
@@ -4615,6 +4747,15 @@ object functions {
    * @since 2.4.0
    */
   def array_repeat(e: Column, count: Int): Column = array_repeat(e, lit(count))
+
+  /**
+   * Returns true if the map contains the key.
+   * @group collection_funcs
+   * @since 3.3.0
+   */
+  def map_contains_key(column: Column, key: Any): Column = withExpr {
+    ArrayContains(MapKeys(column.expr), lit(key).expr)
+  }
 
   /**
    * Returns an unordered array containing the keys of the map.
@@ -5358,5 +5499,14 @@ object functions {
   @scala.annotation.varargs
   def call_udf(udfName: String, cols: Column*): Column = withExpr {
     UnresolvedFunction(udfName, cols.map(_.expr), isDistinct = false)
+  }
+
+  /**
+   * Unwrap UDT data type column into its underlying type.
+   *
+   * @since 3.4.0
+   */
+  def unwrap_udt(column: Column): Column = withExpr {
+    UnwrapUDT(column.expr)
   }
 }

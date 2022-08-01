@@ -126,8 +126,11 @@ private[execution] object HashedRelation {
   /**
    * Create a HashedRelation from an Iterator of InternalRow.
    *
-   * @param allowsNullKey Allow NULL keys in HashedRelation.
-   *                      This is used for full outer join in `ShuffledHashJoinExec` only.
+   * @param allowsNullKey        Allow NULL keys in HashedRelation.
+   *                             This is used for full outer join in `ShuffledHashJoinExec` only.
+   * @param ignoresDuplicatedKey Ignore rows with duplicated keys in HashedRelation.
+   *                             This is only used for semi and anti join without join condition in
+   *                             `ShuffledHashJoinExec` only.
    */
   def apply(
       input: Iterator[InternalRow],
@@ -135,7 +138,8 @@ private[execution] object HashedRelation {
       sizeEstimate: Int = 64,
       taskMemoryManager: TaskMemoryManager = null,
       isNullAware: Boolean = false,
-      allowsNullKey: Boolean = false): HashedRelation = {
+      allowsNullKey: Boolean = false,
+      ignoresDuplicatedKey: Boolean = false): HashedRelation = {
     val mm = Option(taskMemoryManager).getOrElse {
       new TaskMemoryManager(
         new UnifiedMemoryManager(
@@ -152,7 +156,8 @@ private[execution] object HashedRelation {
       // NOTE: LongHashedRelation does not support NULL keys.
       LongHashedRelation(input, key, sizeEstimate, mm, isNullAware)
     } else {
-      UnsafeHashedRelation(input, key, sizeEstimate, mm, isNullAware, allowsNullKey)
+      UnsafeHashedRelation(input, key, sizeEstimate, mm, isNullAware, allowsNullKey,
+        ignoresDuplicatedKey)
     }
   }
 }
@@ -197,7 +202,7 @@ private[execution] class ValueRowWithKeyIndex {
  * A HashedRelation for UnsafeRow, which is backed BytesToBytesMap.
  *
  * It's serialized in the following format:
- *  [number of keys]
+ *  [number of keys] [number of fields]
  *  [size of key] [size of value] [key bytes] [bytes for value]
  */
 private[joins] class UnsafeHashedRelation(
@@ -352,6 +357,7 @@ private[joins] class UnsafeHashedRelation(
       writeInt: (Int) => Unit,
       writeLong: (Long) => Unit,
       writeBuffer: (Array[Byte], Int, Int) => Unit) : Unit = {
+    writeInt(numKeys)
     writeInt(numFields)
     // TODO: move these into BytesToBytesMap
     writeLong(binaryMap.numKeys())
@@ -385,6 +391,7 @@ private[joins] class UnsafeHashedRelation(
       readInt: () => Int,
       readLong: () => Long,
       readBuffer: (Array[Byte], Int, Int) => Unit): Unit = {
+    numKeys = readInt()
     numFields = readInt()
     resultRow = new UnsafeRow(numFields)
     val nKeys = readLong()
@@ -450,7 +457,8 @@ private[joins] object UnsafeHashedRelation {
       sizeEstimate: Int,
       taskMemoryManager: TaskMemoryManager,
       isNullAware: Boolean = false,
-      allowsNullKey: Boolean = false): HashedRelation = {
+      allowsNullKey: Boolean = false,
+      ignoresDuplicatedKey: Boolean = false): HashedRelation = {
     require(!(isNullAware && allowsNullKey),
       "isNullAware and allowsNullKey cannot be enabled at same time")
 
@@ -471,12 +479,14 @@ private[joins] object UnsafeHashedRelation {
       val key = keyGenerator(row)
       if (!key.anyNull || allowsNullKey) {
         val loc = binaryMap.lookup(key.getBaseObject, key.getBaseOffset, key.getSizeInBytes)
-        val success = loc.append(
-          key.getBaseObject, key.getBaseOffset, key.getSizeInBytes,
-          row.getBaseObject, row.getBaseOffset, row.getSizeInBytes)
-        if (!success) {
-          binaryMap.free()
-          throw QueryExecutionErrors.cannotAcquireMemoryToBuildUnsafeHashedRelationError()
+        if (!(ignoresDuplicatedKey && loc.isDefined)) {
+          val success = loc.append(
+            key.getBaseObject, key.getBaseOffset, key.getSizeInBytes,
+            row.getBaseObject, row.getBaseOffset, row.getSizeInBytes)
+          if (!success) {
+            binaryMap.free()
+            throw QueryExecutionErrors.cannotAcquireMemoryToBuildUnsafeHashedRelationError()
+          }
         }
       } else if (isNullAware) {
         binaryMap.free()

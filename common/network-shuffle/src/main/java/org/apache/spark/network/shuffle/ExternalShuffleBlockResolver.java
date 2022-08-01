@@ -20,7 +20,10 @@ package org.apache.spark.network.shuffle;
 import java.io.*;
 import java.nio.charset.StandardCharsets;
 import java.util.*;
-import java.util.concurrent.*;
+import java.util.concurrent.ConcurrentMap;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.Executor;
+import java.util.concurrent.Executors;
 import java.util.stream.Collectors;
 
 import org.apache.commons.lang3.builder.ToStringBuilder;
@@ -29,10 +32,11 @@ import org.apache.commons.lang3.tuple.Pair;
 import com.fasterxml.jackson.annotation.JsonCreator;
 import com.fasterxml.jackson.annotation.JsonProperty;
 import com.fasterxml.jackson.databind.ObjectMapper;
-import com.github.benmanes.caffeine.cache.Caffeine;
-import com.github.benmanes.caffeine.cache.LoadingCache;
-import com.github.benmanes.caffeine.cache.Weigher;
 import com.google.common.annotations.VisibleForTesting;
+import com.google.common.cache.CacheBuilder;
+import com.google.common.cache.CacheLoader;
+import com.google.common.cache.LoadingCache;
+import com.google.common.cache.Weigher;
 import com.google.common.collect.Maps;
 import org.iq80.leveldb.DB;
 import org.iq80.leveldb.DBIterator;
@@ -76,7 +80,7 @@ public class ExternalShuffleBlockResolver {
    *  Caches index file information so that we can avoid open/close the index files
    *  for each block fetch.
    */
-  private final LoadingCache<File, ShuffleIndexInformation> shuffleIndexCache;
+  private final LoadingCache<String, ShuffleIndexInformation> shuffleIndexCache;
 
   // Single-threaded Java executor used to perform expensive recursive directory deletion.
   private final Executor directoryCleaner;
@@ -108,10 +112,18 @@ public class ExternalShuffleBlockResolver {
       Boolean.parseBoolean(conf.get(Constants.SHUFFLE_SERVICE_FETCH_RDD_ENABLED, "false"));
     this.registeredExecutorFile = registeredExecutorFile;
     String indexCacheSize = conf.get("spark.shuffle.service.index.cache.size", "100m");
-    shuffleIndexCache = Caffeine.newBuilder()
+    CacheLoader<String, ShuffleIndexInformation> indexCacheLoader =
+        new CacheLoader<String, ShuffleIndexInformation>() {
+          @Override
+          public ShuffleIndexInformation load(String filePath) throws IOException {
+            return new ShuffleIndexInformation(filePath);
+          }
+        };
+    shuffleIndexCache = CacheBuilder.newBuilder()
       .maximumWeight(JavaUtils.byteStringAsBytes(indexCacheSize))
-      .weigher((Weigher<File, ShuffleIndexInformation>)(file, indexInfo) -> indexInfo.getSize())
-      .build(ShuffleIndexInformation::new);
+      .weigher((Weigher<String, ShuffleIndexInformation>)
+        (filePath, indexInfo) -> indexInfo.getRetainedMemorySize())
+      .build(indexCacheLoader);
     db = LevelDBProvider.initLevelDB(this.registeredExecutorFile, CURRENT_VERSION, mapper);
     if (db != null) {
       executors = reloadRegisteredExecutors(db);
@@ -290,28 +302,35 @@ public class ExternalShuffleBlockResolver {
    */
   private ManagedBuffer getSortBasedShuffleBlockData(
     ExecutorShuffleInfo executor, int shuffleId, long mapId, int startReduceId, int endReduceId) {
-    File indexFile = ExecutorDiskUtils.getFile(executor.localDirs, executor.subDirsPerLocalDir,
-      "shuffle_" + shuffleId + "_" + mapId + "_0.index");
+    String indexFilePath =
+      ExecutorDiskUtils.getFilePath(
+        executor.localDirs,
+        executor.subDirsPerLocalDir,
+        "shuffle_" + shuffleId + "_" + mapId + "_0.index");
 
     try {
-      ShuffleIndexInformation shuffleIndexInformation = shuffleIndexCache.get(indexFile);
+      ShuffleIndexInformation shuffleIndexInformation = shuffleIndexCache.get(indexFilePath);
       ShuffleIndexRecord shuffleIndexRecord = shuffleIndexInformation.getIndex(
         startReduceId, endReduceId);
       return new FileSegmentManagedBuffer(
         conf,
-        ExecutorDiskUtils.getFile(executor.localDirs, executor.subDirsPerLocalDir,
-          "shuffle_" + shuffleId + "_" + mapId + "_0.data"),
+        new File(
+          ExecutorDiskUtils.getFilePath(
+            executor.localDirs,
+            executor.subDirsPerLocalDir,
+            "shuffle_" + shuffleId + "_" + mapId + "_0.data")),
         shuffleIndexRecord.getOffset(),
         shuffleIndexRecord.getLength());
-    } catch (CompletionException e) {
-      throw new RuntimeException("Failed to open file: " + indexFile, e);
+    } catch (ExecutionException e) {
+      throw new RuntimeException("Failed to open file: " + indexFilePath, e);
     }
   }
 
   public ManagedBuffer getDiskPersistedRddBlockData(
       ExecutorShuffleInfo executor, int rddId, int splitIndex) {
-    File file = ExecutorDiskUtils.getFile(executor.localDirs, executor.subDirsPerLocalDir,
-      "rdd_" + rddId + "_" + splitIndex);
+    File file = new File(
+      ExecutorDiskUtils.getFilePath(
+        executor.localDirs, executor.subDirsPerLocalDir, "rdd_" + rddId + "_" + splitIndex));
     long fileLength = file.length();
     ManagedBuffer res = null;
     if (file.exists()) {
@@ -338,8 +357,8 @@ public class ExternalShuffleBlockResolver {
     }
     int numRemovedBlocks = 0;
     for (String blockId : blockIds) {
-      File file =
-        ExecutorDiskUtils.getFile(executor.localDirs, executor.subDirsPerLocalDir, blockId);
+      File file = new File(
+        ExecutorDiskUtils.getFilePath(executor.localDirs, executor.subDirsPerLocalDir, blockId));
       if (file.delete()) {
         numRemovedBlocks++;
       } else {
@@ -376,10 +395,8 @@ public class ExternalShuffleBlockResolver {
     ExecutorShuffleInfo executor = executors.get(new AppExecId(appId, execId));
     // This should be in sync with IndexShuffleBlockResolver.getChecksumFile
     String fileName = "shuffle_" + shuffleId + "_" + mapId + "_0.checksum." + algorithm;
-    File checksumFile = ExecutorDiskUtils.getFile(
-      executor.localDirs,
-      executor.subDirsPerLocalDir,
-      fileName);
+    File checksumFile = new File(
+      ExecutorDiskUtils.getFilePath(executor.localDirs, executor.subDirsPerLocalDir, fileName));
     ManagedBuffer data = getBlockData(appId, execId, shuffleId, mapId, reduceId);
     return ShuffleChecksumHelper.diagnoseCorruption(
       algorithm, checksumFile, reduceId, data, checksumByReader);

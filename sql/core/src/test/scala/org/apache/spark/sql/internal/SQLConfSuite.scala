@@ -20,7 +20,7 @@ package org.apache.spark.sql.internal
 import java.util.TimeZone
 
 import org.apache.hadoop.fs.Path
-import org.apache.log4j.Level
+import org.apache.logging.log4j.Level
 
 import org.apache.spark.sql._
 import org.apache.spark.sql.catalyst.parser.ParseException
@@ -205,7 +205,8 @@ class SQLConfSuite extends QueryTest with SharedSparkSession {
     assert(spark.conf.get("spark.app.id") === appId, "Should not change spark core ones")
     // spark core conf w/ entry registered
     val e1 = intercept[AnalysisException](sql("RESET spark.executor.cores"))
-    assert(e1.getMessage === "Cannot modify the value of a Spark config: spark.executor.cores")
+    val str_match = "Cannot modify the value of a Spark config: spark.executor.cores"
+    assert(e1.getMessage.contains(str_match))
 
     // user defined settings
     sql("SET spark.abc=xyz")
@@ -319,6 +320,11 @@ class SQLConfSuite extends QueryTest with SharedSparkSession {
     assert(e2.message.contains("Cannot modify the value of a static config"))
   }
 
+  test("SPARK-36643: Show migration guide when attempting SparkConf") {
+    val e1 = intercept[AnalysisException](spark.conf.set("spark.driver.host", "myhost"))
+    assert(e1.message.contains("https://spark.apache.org/docs/latest/sql-migration-guide.html"))
+  }
+
   test("SPARK-21588 SQLContext.getConf(key, null) should return null") {
     withSQLConf(SQLConf.SHUFFLE_PARTITIONS.key -> "1") {
       assert("1" == spark.conf.get(SQLConf.SHUFFLE_PARTITIONS.key, null))
@@ -337,10 +343,10 @@ class SQLConfSuite extends QueryTest with SharedSparkSession {
     assert(spark.sessionState.conf.parquetOutputTimestampType ==
       SQLConf.ParquetOutputTimestampType.INT96)
 
-    spark.sessionState.conf.setConf(SQLConf.PARQUET_OUTPUT_TIMESTAMP_TYPE, "timestamp_micros")
+    spark.conf.set(SQLConf.PARQUET_OUTPUT_TIMESTAMP_TYPE, "timestamp_micros")
     assert(spark.sessionState.conf.parquetOutputTimestampType ==
       SQLConf.ParquetOutputTimestampType.TIMESTAMP_MICROS)
-    spark.sessionState.conf.setConf(SQLConf.PARQUET_OUTPUT_TIMESTAMP_TYPE, "int96")
+    spark.conf.set(SQLConf.PARQUET_OUTPUT_TIMESTAMP_TYPE, "int96")
     assert(spark.sessionState.conf.parquetOutputTimestampType ==
       SQLConf.ParquetOutputTimestampType.INT96)
 
@@ -356,9 +362,9 @@ class SQLConfSuite extends QueryTest with SharedSparkSession {
     val fallback = SQLConf.buildConf("spark.sql.__test__.spark_22779")
       .fallbackConf(SQLConf.PARQUET_COMPRESSION)
 
-    assert(spark.sessionState.conf.getConfString(fallback.key) ===
+    assert(spark.conf.get(fallback.key) ===
       SQLConf.PARQUET_COMPRESSION.defaultValue.get)
-    assert(spark.sessionState.conf.getConfString(fallback.key, "lzo") === "lzo")
+    assert(spark.conf.get(fallback.key, "lzo") === "lzo")
 
     val displayValue = spark.sessionState.conf.getAllDefinedConfs
       .find { case (key, _, _, _) => key == fallback.key }
@@ -366,11 +372,11 @@ class SQLConfSuite extends QueryTest with SharedSparkSession {
       .get
     assert(displayValue === fallback.defaultValueString)
 
-    spark.sessionState.conf.setConf(SQLConf.PARQUET_COMPRESSION, "gzip")
-    assert(spark.sessionState.conf.getConfString(fallback.key) === "gzip")
+    spark.conf.set(SQLConf.PARQUET_COMPRESSION, "gzip")
+    assert(spark.conf.get(fallback.key) === "gzip")
 
-    spark.sessionState.conf.setConf(fallback, "lzo")
-    assert(spark.sessionState.conf.getConfString(fallback.key) === "lzo")
+    spark.conf.set(fallback, "lzo")
+    assert(spark.conf.get(fallback.key) === "lzo")
 
     val newDisplayValue = spark.sessionState.conf.getAllDefinedConfs
       .find { case (key, _, _, _) => key == fallback.key }
@@ -409,7 +415,7 @@ class SQLConfSuite extends QueryTest with SharedSparkSession {
     def check(config: String): Unit = {
       assert(logAppender.loggingEvents.exists(
         e => e.getLevel == Level.WARN &&
-        e.getRenderedMessage.contains(config)))
+        e.getMessage.getFormattedMessage.contains(config)))
     }
 
     val config1 = SQLConf.HIVE_VERIFY_PARTITION_PATH.key
@@ -463,7 +469,7 @@ class SQLConfSuite extends QueryTest with SharedSparkSession {
       if (i == 0) {
         assert(zone === "Z")
       } else {
-        assert(zone === String.format("%+03d:00", new Integer(i)))
+        assert(zone === String.format("%+03d:00", Integer.valueOf(i)))
       }
     }
     val e2 = intercept[ParseException](sql("set time zone interval 19 hours"))

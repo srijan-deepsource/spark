@@ -93,7 +93,8 @@ import org.apache.spark.network.yarn.util.HadoopConfigProvider;
  * This {@code classpath} configuration is only supported on YARN versions >= 2.9.0.
  */
 public class YarnShuffleService extends AuxiliaryService {
-  private static final Logger logger = LoggerFactory.getLogger(YarnShuffleService.class);
+  private static final Logger defaultLogger = LoggerFactory.getLogger(YarnShuffleService.class);
+  private Logger logger = defaultLogger;
 
   // Port on which the shuffle server listens for fetch requests
   private static final String SPARK_SHUFFLE_SERVICE_PORT_KEY = "spark.shuffle.service.port";
@@ -107,12 +108,20 @@ public class YarnShuffleService extends AuxiliaryService {
       "spark.yarn.shuffle.service.metrics.namespace";
   private static final String DEFAULT_SPARK_SHUFFLE_SERVICE_METRICS_NAME = "sparkShuffleService";
 
+  /**
+   * The namespace to use for the logs produced by the shuffle service
+   */
+  static final String SPARK_SHUFFLE_SERVICE_LOGS_NAMESPACE_KEY =
+      "spark.yarn.shuffle.service.logs.namespace";
+
   // Whether the shuffle server should authenticate fetch requests
   private static final String SPARK_AUTHENTICATE_KEY = "spark.authenticate";
   private static final boolean DEFAULT_SPARK_AUTHENTICATE = false;
 
   private static final String RECOVERY_FILE_NAME = "registeredExecutors.ldb";
   private static final String SECRETS_RECOVERY_FILE_NAME = "sparkShuffleRecovery.ldb";
+  @VisibleForTesting
+  static final String SPARK_SHUFFLE_MERGE_RECOVERY_FILE_NAME = "sparkShuffleMergeRecovery.ldb";
 
   // Whether failure during service initialization should stop the NM.
   @VisibleForTesting
@@ -149,7 +158,8 @@ public class YarnShuffleService extends AuxiliaryService {
 
   private TransportContext transportContext = null;
 
-  private Configuration _conf = null;
+  @VisibleForTesting
+  Configuration _conf = null;
 
   // The recovery path used to shuffle service recovery
   @VisibleForTesting
@@ -159,6 +169,10 @@ public class YarnShuffleService extends AuxiliaryService {
   @VisibleForTesting
   ExternalBlockHandler blockHandler;
 
+  // Handles merged shuffle registration, push blocks and finalization
+  @VisibleForTesting
+  MergedShuffleFileManager shuffleMergeManager;
+
   // Where to store & reload executor info for recovering state after an NM restart
   @VisibleForTesting
   File registeredExecutorFile;
@@ -166,6 +180,10 @@ public class YarnShuffleService extends AuxiliaryService {
   // Where to store & reload application secrets for recovering state after an NM restart
   @VisibleForTesting
   File secretsFile;
+
+  // Where to store & reload merge manager info for recovering state after an NM restart
+  @VisibleForTesting
+  File mergeManagerFile;
 
   private DB db;
 
@@ -204,6 +222,13 @@ public class YarnShuffleService extends AuxiliaryService {
           confOverlayUrl);
       _conf.addResource(confOverlayUrl);
     }
+
+    String logsNamespace = _conf.get(SPARK_SHUFFLE_SERVICE_LOGS_NAMESPACE_KEY, "");
+    if (!logsNamespace.isEmpty()) {
+      String className = YarnShuffleService.class.getName();
+      logger = LoggerFactory.getLogger(className + "." + logsNamespace);
+    }
+
     super.serviceInit(_conf);
 
     boolean stopOnFailure = _conf.getBoolean(STOP_ON_FAILURE_KEY, DEFAULT_STOP_ON_FAILURE);
@@ -216,11 +241,16 @@ public class YarnShuffleService extends AuxiliaryService {
       // when it comes back
       if (_recoveryPath != null) {
         registeredExecutorFile = initRecoveryDb(RECOVERY_FILE_NAME);
+        mergeManagerFile = initRecoveryDb(SPARK_SHUFFLE_MERGE_RECOVERY_FILE_NAME);
       }
 
       TransportConf transportConf = new TransportConf("shuffle", new HadoopConfigProvider(_conf));
-      MergedShuffleFileManager shuffleMergeManager = newMergedShuffleFileManagerInstance(
-        transportConf);
+      // Create new MergedShuffleFileManager if shuffleMergeManager is null.
+      // This is because in the unit test, a customized MergedShuffleFileManager will
+      // be created through setShuffleFileManager method.
+      if (shuffleMergeManager == null) {
+        shuffleMergeManager = newMergedShuffleFileManagerInstance(transportConf, mergeManagerFile);
+      }
       blockHandler = new ExternalBlockHandler(
         transportConf, registeredExecutorFile, shuffleMergeManager);
 
@@ -272,8 +302,18 @@ public class YarnShuffleService extends AuxiliaryService {
     }
   }
 
+  /**
+   * Set the customized MergedShuffleFileManager for unit testing only
+   * @param mergeManager
+   */
   @VisibleForTesting
-  static MergedShuffleFileManager newMergedShuffleFileManagerInstance(TransportConf conf) {
+  void setShuffleMergeManager(MergedShuffleFileManager mergeManager) {
+    this.shuffleMergeManager = mergeManager;
+  }
+
+  @VisibleForTesting
+  static MergedShuffleFileManager newMergedShuffleFileManagerInstance(
+      TransportConf conf, File mergeManagerFile) {
     String mergeManagerImplClassName = conf.mergedShuffleFileManagerImpl();
     try {
       Class<?> mergeManagerImplClazz = Class.forName(
@@ -282,10 +322,11 @@ public class YarnShuffleService extends AuxiliaryService {
         mergeManagerImplClazz.asSubclass(MergedShuffleFileManager.class);
       // The assumption is that all the custom implementations just like the RemoteBlockPushResolver
       // will also need the transport configuration.
-      return mergeManagerSubClazz.getConstructor(TransportConf.class).newInstance(conf);
+      return mergeManagerSubClazz.getConstructor(TransportConf.class, File.class)
+        .newInstance(conf, mergeManagerFile);
     } catch (Exception e) {
-      logger.error("Unable to create an instance of {}", mergeManagerImplClassName);
-      return new NoOpMergedShuffleFileManager(conf);
+      defaultLogger.error("Unable to create an instance of {}", mergeManagerImplClassName);
+      return new NoOpMergedShuffleFileManager(conf, mergeManagerFile);
     }
   }
 

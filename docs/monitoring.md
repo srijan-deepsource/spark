@@ -357,7 +357,7 @@ Security options for the Spark History Server are covered more detail in the
   </tr>
   <tr>
     <td>spark.history.custom.executor.log.url.applyIncompleteApplication</td>
-    <td>false</td>
+    <td>true</td>
     <td>
         Specifies whether to apply custom spark executor log URL to incomplete applications as well.
         If executor logs for running applications should be provided as origin log URLs, set this to `false`.
@@ -477,7 +477,7 @@ can be identified by their `[attempt-id]`. In the API listed below, when running
       A list of all stages for a given application.
         <br><code>?status=[active|complete|pending|failed]</code> list only stages in the given state.
         <br><code>?details=true</code> lists all stages with the task data.
-        <br><code>?taskStatus=[RUNNING|SUCCESS|FAILED|KILLED|PENDING]</code> lists stages only those tasks with the specified task status. Query parameter taskStatus takes effect only when <code>details=true</code>.
+        <br><code>?taskStatus=[RUNNING|SUCCESS|FAILED|KILLED|PENDING]</code> lists only those tasks with the specified task status. Query parameter taskStatus takes effect only when <code>details=true</code>. This also supports multiple <code>taskStatus</code> such as <code>?details=true&taskStatus=SUCCESS&taskStatus=FAILED</code> which will return all tasks matching any of specified task status.
         <br><code>?withSummaries=true</code> lists stages with task metrics distribution and executor metrics distribution.
         <br><code>?quantiles=0.0,0.25,0.5,0.75,1.0</code> summarize the metrics with the given quantiles. Query parameter quantiles takes effect only when <code>withSummaries=true</code>. Default value is <code>0.0,0.25,0.5,0.75,1.0</code>. 
     </td>
@@ -487,7 +487,7 @@ can be identified by their `[attempt-id]`. In the API listed below, when running
     <td>
       A list of all attempts for the given stage.
         <br><code>?details=true</code> lists all attempts with the task data for the given stage.
-        <br><code>?taskStatus=[RUNNING|SUCCESS|FAILED|KILLED|PENDING]</code> lists only those tasks with the specified task status. Query parameter taskStatus takes effect only when <code>details=true</code>.
+        <br><code>?taskStatus=[RUNNING|SUCCESS|FAILED|KILLED|PENDING]</code> lists only those tasks with the specified task status. Query parameter taskStatus takes effect only when <code>details=true</code>. This also supports multiple <code>taskStatus</code> such as <code>?details=true&taskStatus=SUCCESS&taskStatus=FAILED</code> which will return all tasks matching any of specified task status.
         <br><code>?withSummaries=true</code> lists task metrics distribution and executor metrics distribution of each attempt.
         <br><code>?quantiles=0.0,0.25,0.5,0.75,1.0</code> summarize the metrics with the given quantiles. Query parameter quantiles takes effect only when <code>withSummaries=true</code>. Default value is <code>0.0,0.25,0.5,0.75,1.0</code>. 
       <br>Example:
@@ -502,7 +502,7 @@ can be identified by their `[attempt-id]`. In the API listed below, when running
     <td>
       Details for the given stage attempt.
         <br><code>?details=true</code> lists all task data for the given stage attempt.
-        <br><code>?taskStatus=[RUNNING|SUCCESS|FAILED|KILLED|PENDING]</code> lists only those tasks with the specified task status. Query parameter taskStatus takes effect only when <code>details=true</code>.
+        <br><code>?taskStatus=[RUNNING|SUCCESS|FAILED|KILLED|PENDING]</code> lists only those tasks with the specified task status. Query parameter taskStatus takes effect only when <code>details=true</code>. This also supports multiple <code>taskStatus</code> such as <code>?details=true&taskStatus=SUCCESS&taskStatus=FAILED</code> which will return all tasks matching any of specified task status.
         <br><code>?withSummaries=true</code> lists task metrics distribution and executor metrics distribution for the given stage attempt.
         <br><code>?quantiles=0.0,0.25,0.5,0.75,1.0</code> summarize the metrics with the given quantiles. Query parameter quantiles takes effect only when <code>withSummaries=true</code>. Default value is <code>0.0,0.25,0.5,0.75,1.0</code>. 
       <br>Example:
@@ -609,6 +609,17 @@ can be identified by their `[attempt-id]`. In the API listed below, when running
     <code>?details=[true (default) | false]</code> lists/hides metric details in addition to given query details.
     <br>
     <code>?planDescription=[true (default) | false]</code> enables/disables Physical <code>planDescription</code> on demand for the given query when Physical Plan size is high.
+    </td>
+  </tr>
+  <tr>
+    <td><code>/applications/[app-id]/diagnostics/sql/[execution-id]</code></td>
+    <td>Diagnostic for the given query, including:
+    <br>
+    1. plan change history of adaptive execution
+    <br>
+    2. physical plan description with unlimited fields
+    <br>
+    This API requires setting <code>spark.appStatusStore.diskStoreDir</code> for storing the diagnostic information.
     </td>
   </tr>
   <tr>

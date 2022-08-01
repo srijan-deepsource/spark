@@ -166,11 +166,23 @@ abstract class TypeCoercionBase {
     }
   }
 
+  protected def findWiderDateTimeType(d1: DatetimeType, d2: DatetimeType): DatetimeType =
+    (d1, d2) match {
+      case (_: TimestampType, _: DateType) | (_: DateType, _: TimestampType) =>
+        TimestampType
+
+      case (_: TimestampType, _: TimestampNTZType) | (_: TimestampNTZType, _: TimestampType) =>
+        TimestampType
+
+      case (_: TimestampNTZType, _: DateType) | (_: DateType, _: TimestampNTZType) =>
+        TimestampNTZType
+    }
+
   /**
    * Type coercion rule that combines multiple type coercion rules and applies them in a single tree
    * traversal.
    */
-  case class CombinedTypeCoercionRule(rules: Seq[TypeCoercionRule]) extends TypeCoercionRule {
+  class CombinedTypeCoercionRule(rules: Seq[TypeCoercionRule]) extends TypeCoercionRule {
     override def transform: PartialFunction[Expression, Expression] = {
       val transforms = rules.map(_.transform)
       Function.unlift { e: Expression =>
@@ -184,6 +196,21 @@ abstract class TypeCoercionBase {
         }
       }
     }
+  }
+
+  /**
+   * Widens the data types of the [[Unpivot]] values.
+   */
+  object UnpivotCoercion extends Rule[LogicalPlan] {
+    override def apply(plan: LogicalPlan): LogicalPlan = plan resolveOperators {
+      case up: Unpivot
+        if up.values.nonEmpty && up.values.forall(_.resolved) && !up.valuesTypeCoercioned =>
+        val valueDataType = findWiderTypeWithoutStringPromotion(up.values.map(_.dataType))
+        val values = valueDataType.map(valueType =>
+          up.values.map(value => Alias(Cast(value, valueType), value.name)())
+        ).getOrElse(up.values)
+        up.copy(values = values)
+      }
   }
 
   /**
@@ -243,6 +270,7 @@ abstract class TypeCoercionBase {
         case s: Union if s.childrenResolved && !s.byName &&
           s.children.forall(_.output.length == s.children.head.output.length) && !s.resolved =>
           val newChildren: Seq[LogicalPlan] = buildNewChildrenWithWiderTypes(s.children)
+
           if (newChildren.isEmpty) {
             s -> Nil
           } else {
@@ -258,10 +286,10 @@ abstract class TypeCoercionBase {
 
       // Get a sequence of data types, each of which is the widest type of this specific attribute
       // in all the children
-      val targetTypes: Seq[DataType] =
-        getWidestTypes(children, attrIndex = 0, mutable.Queue[DataType]())
+      val targetTypes: Seq[Option[DataType]] =
+        getWidestTypes(children, attrIndex = 0, mutable.Queue[Option[DataType]]())
 
-      if (targetTypes.nonEmpty) {
+      if (targetTypes.exists(_.isDefined)) {
         // Add an extra Project if the targetTypes are different from the original types.
         children.map(widenTypes(_, targetTypes))
       } else {
@@ -273,29 +301,30 @@ abstract class TypeCoercionBase {
     @tailrec private def getWidestTypes(
         children: Seq[LogicalPlan],
         attrIndex: Int,
-        castedTypes: mutable.Queue[DataType]): Seq[DataType] = {
+        castedTypes: mutable.Queue[Option[DataType]]): Seq[Option[DataType]] = {
       // Return the result after the widen data types have been found for all the children
       if (attrIndex >= children.head.output.length) return castedTypes.toSeq
 
       // For the attrIndex-th attribute, find the widest type
-      findWiderCommonType(children.map(_.output(attrIndex).dataType)) match {
-        // If unable to find an appropriate widen type for this column, return an empty Seq
-        case None => Seq.empty[DataType]
-        // Otherwise, record the result in the queue and find the type for the next column
-        case Some(widenType) =>
-          castedTypes.enqueue(widenType)
-          getWidestTypes(children, attrIndex + 1, castedTypes)
-      }
+      val widenTypeOpt = findWiderCommonType(children.map(_.output(attrIndex).dataType))
+      castedTypes.enqueue(widenTypeOpt)
+      getWidestTypes(children, attrIndex + 1, castedTypes)
     }
 
     /** Given a plan, add an extra project on top to widen some columns' data types. */
-    private def widenTypes(plan: LogicalPlan, targetTypes: Seq[DataType]): LogicalPlan = {
+    private def widenTypes(plan: LogicalPlan, targetTypes: Seq[Option[DataType]]): LogicalPlan = {
+      var changed = false
       val casted = plan.output.zip(targetTypes).map {
-        case (e, dt) if e.dataType != dt =>
+        case (e, Some(dt)) if e.dataType != dt =>
+          changed = true
           Alias(Cast(e, dt, Some(conf.sessionLocalTimeZone)), e.name)()
         case (e, _) => e
       }
-      Project(casted, plan)
+      if (changed) {
+        Project(casted, plan)
+      } else {
+        plan
+      }
     }
   }
 
@@ -758,7 +787,7 @@ abstract class TypeCoercionBase {
       case e if !e.childrenResolved => e
       case DateAdd(l, r) if r.dataType == StringType && r.foldable =>
         val days = try {
-          AnsiCast(r, IntegerType).eval().asInstanceOf[Int]
+          Cast(r, IntegerType, ansiEnabled = true).eval().asInstanceOf[Int]
         } catch {
           case e: NumberFormatException =>
             throw QueryCompilationErrors.secondArgumentOfFunctionIsNotIntegerError("date_add", e)
@@ -766,7 +795,7 @@ abstract class TypeCoercionBase {
         DateAdd(l, Literal(days))
       case DateSub(l, r) if r.dataType == StringType && r.foldable =>
         val days = try {
-          AnsiCast(r, IntegerType).eval().asInstanceOf[Int]
+          Cast(r, IntegerType, ansiEnabled = true).eval().asInstanceOf[Int]
         } catch {
           case e: NumberFormatException =>
             throw QueryCompilationErrors.secondArgumentOfFunctionIsNotIntegerError("date_sub", e)
@@ -792,8 +821,9 @@ abstract class TypeCoercionBase {
 object TypeCoercion extends TypeCoercionBase {
 
   override def typeCoercionRules: List[Rule[LogicalPlan]] =
+    UnpivotCoercion ::
     WidenSetOperationTypes ::
-    CombinedTypeCoercionRule(
+    new CombinedTypeCoercionRule(
       InConversion ::
       PromoteStrings ::
       DecimalPrecision ::
@@ -841,16 +871,12 @@ object TypeCoercion extends TypeCoercionBase {
         val index = numericPrecedence.lastIndexWhere(t => t == t1 || t == t2)
         Some(numericPrecedence(index))
 
-      case (_: TimestampType, _: DateType) | (_: DateType, _: TimestampType) =>
-        Some(TimestampType)
+      case (d1: DatetimeType, d2: DatetimeType) => Some(findWiderDateTimeType(d1, d2))
 
       case (t1: DayTimeIntervalType, t2: DayTimeIntervalType) =>
         Some(DayTimeIntervalType(t1.startField.min(t2.startField), t1.endField.max(t2.endField)))
       case (t1: YearMonthIntervalType, t2: YearMonthIntervalType) =>
         Some(YearMonthIntervalType(t1.startField.min(t2.startField), t1.endField.max(t2.endField)))
-
-      case (_: TimestampNTZType, _: DateType) | (_: DateType, _: TimestampNTZType) =>
-        Some(TimestampNTZType)
 
       case (t1, t2) => findTypeForComplex(t1, t2, findTightestCommonType)
   }
@@ -860,6 +886,18 @@ object TypeCoercion extends TypeCoercionBase {
     case (StringType, t2: AtomicType) if t2 != BinaryType && t2 != BooleanType => Some(StringType)
     case (t1: AtomicType, StringType) if t1 != BinaryType && t1 != BooleanType => Some(StringType)
     case _ => None
+  }
+
+  // Return whether a string literal can be promoted as the give data type in a binary comparison.
+  private def canPromoteAsInBinaryComparison(dt: DataType) = dt match {
+    // If a binary comparison contains interval type and string type, we can't decide which
+    // interval type the string should be promoted as. There are many possible interval
+    // types, such as year interval, month interval, day interval, hour interval, etc.
+    case _: YearMonthIntervalType | _: DayTimeIntervalType => false
+    // There is no need to add `Cast` for comparison between strings.
+    case _: StringType => false
+    case _: AtomicType => true
+    case _ => false
   }
 
   /**
@@ -891,8 +929,8 @@ object TypeCoercion extends TypeCoercionBase {
     case (n: DecimalType, s: StringType) => Some(DoubleType)
     case (s: StringType, n: DecimalType) => Some(DoubleType)
 
-    case (l: StringType, r: AtomicType) if r != StringType => Some(r)
-    case (l: AtomicType, r: StringType) if l != StringType => Some(l)
+    case (l: StringType, r: AtomicType) if canPromoteAsInBinaryComparison(r) => Some(r)
+    case (l: AtomicType, r: StringType) if canPromoteAsInBinaryComparison(l) => Some(l)
     case (l, r) => None
   }
 
@@ -945,15 +983,13 @@ object TypeCoercion extends TypeCoercionBase {
       case (_: NumericType, target: NumericType) => target
 
       // Implicit cast between date time types
-      case (DateType, TimestampType) => TimestampType
-      case (DateType, AnyTimestampType) => AnyTimestampType.defaultConcreteType
-      case (TimestampType | TimestampNTZType, DateType) => DateType
+      case (_: DatetimeType, d: DatetimeType) => d
+      case (_: DatetimeType, AnyTimestampType) => AnyTimestampType.defaultConcreteType
 
       // Implicit cast from/to string
       case (StringType, DecimalType) => DecimalType.SYSTEM_DEFAULT
       case (StringType, target: NumericType) => target
-      case (StringType, DateType) => DateType
-      case (StringType, TimestampType) => TimestampType
+      case (StringType, datetime: DatetimeType) => datetime
       case (StringType, AnyTimestampType) => AnyTimestampType.defaultConcreteType
       case (StringType, BinaryType) => BinaryType
       // Cast any atomic type to string.
@@ -1033,6 +1069,7 @@ object TypeCoercion extends TypeCoercionBase {
   /**
    * Whether the data type contains StringType.
    */
+  @tailrec
   def hasStringType(dt: DataType): Boolean = dt match {
     case StringType => true
     case ArrayType(et, _) => hasStringType(et)
@@ -1074,24 +1111,6 @@ object TypeCoercion extends TypeCoercionBase {
           if findCommonTypeForBinaryComparison(left.dataType, right.dataType, conf).isDefined =>
         val commonType = findCommonTypeForBinaryComparison(left.dataType, right.dataType, conf).get
         p.makeCopy(Array(castExpr(left, commonType), castExpr(right, commonType)))
-
-      case Abs(e @ StringType(), failOnError) => Abs(Cast(e, DoubleType), failOnError)
-      case Sum(e @ StringType(), _) => Sum(Cast(e, DoubleType))
-      case Average(e @ StringType(), _) => Average(Cast(e, DoubleType))
-      case s @ StddevPop(e @ StringType(), _) =>
-        s.withNewChildren(Seq(Cast(e, DoubleType)))
-      case s @ StddevSamp(e @ StringType(), _) =>
-        s.withNewChildren(Seq(Cast(e, DoubleType)))
-      case m @ UnaryMinus(e @ StringType(), _) => m.withNewChildren(Seq(Cast(e, DoubleType)))
-      case UnaryPositive(e @ StringType()) => UnaryPositive(Cast(e, DoubleType))
-      case v @ VariancePop(e @ StringType(), _) =>
-        v.withNewChildren(Seq(Cast(e, DoubleType)))
-      case v @ VarianceSamp(e @ StringType(), _) =>
-        v.withNewChildren(Seq(Cast(e, DoubleType)))
-      case s @ Skewness(e @ StringType(), _) =>
-        s.withNewChildren(Seq(Cast(e, DoubleType)))
-      case k @ Kurtosis(e @ StringType(), _) =>
-        k.withNewChildren(Seq(Cast(e, DoubleType)))
     }
   }
 
@@ -1143,9 +1162,9 @@ object TypeCoercion extends TypeCoercionBase {
     override val transform: PartialFunction[Expression, Expression] = {
       // Skip nodes who's children have not been resolved yet.
       case e if !e.childrenResolved => e
-      case d @ DateAdd(TimestampType(), _) => d.copy(startDate = Cast(d.startDate, DateType))
+      case d @ DateAdd(AnyTimestampType(), _) => d.copy(startDate = Cast(d.startDate, DateType))
       case d @ DateAdd(StringType(), _) => d.copy(startDate = Cast(d.startDate, DateType))
-      case d @ DateSub(TimestampType(), _) => d.copy(startDate = Cast(d.startDate, DateType))
+      case d @ DateSub(AnyTimestampType(), _) => d.copy(startDate = Cast(d.startDate, DateType))
       case d @ DateSub(StringType(), _) => d.copy(startDate = Cast(d.startDate, DateType))
 
       case s @ SubtractTimestamps(DateType(), AnyTimestampType(), _, _) =>

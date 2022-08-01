@@ -192,7 +192,7 @@ abstract class FileStreamSourceTest
 
   protected def getSourcesFromStreamingQuery(query: StreamExecution): Seq[FileStreamSource] = {
     query.logicalPlan.collect {
-      case StreamingExecutionRelation(source, _) if source.isInstanceOf[FileStreamSource] =>
+      case StreamingExecutionRelation(source, _, _) if source.isInstanceOf[FileStreamSource] =>
         source.asInstanceOf[FileStreamSource]
     }
   }
@@ -257,7 +257,7 @@ class FileStreamSourceSuite extends FileStreamSourceTest {
 
   override def beforeAll(): Unit = {
     super.beforeAll()
-    spark.sessionState.conf.setConf(SQLConf.ORC_IMPLEMENTATION, "native")
+    spark.conf.set(SQLConf.ORC_IMPLEMENTATION, "native")
   }
 
   override def afterAll(): Unit = {
@@ -1273,6 +1273,7 @@ class FileStreamSourceSuite extends FileStreamSourceTest {
         .text(src.getCanonicalPath)
 
       def startQuery(): StreamingQuery = {
+        // NOTE: the test uses the deprecated Trigger.Once() by intention, do not change.
         df.writeStream
           .format("parquet")
           .trigger(Trigger.Once)
@@ -1300,6 +1301,89 @@ class FileStreamSourceSuite extends FileStreamSourceTest {
         checkAnswer(sql(s"SELECT * from parquet.`$targetDir`"), (1 to 5).map(_.toString).toDF)
       } finally {
         q2.stop()
+      }
+    }
+  }
+
+  test("SPARK-36533: Trigger.AvailableNow - multiple queries with checkpoint") {
+    withTempDirs { (src, target) =>
+      val checkpoint = new File(target, "chk").getCanonicalPath
+      var lastFileModTime: Option[Long] = None
+
+      /** Create a text file with a single data item */
+      def createFile(data: Int): File = {
+        val file = stringToFile(new File(src, s"$data.txt"), data.toString)
+        if (lastFileModTime.nonEmpty) file.setLastModified(lastFileModTime.get + 1000)
+        lastFileModTime = Some(file.lastModified)
+        file
+      }
+
+      createFile(1)
+      createFile(2)
+      createFile(3)
+
+      // Set up a query to read text files one at a time
+      val df = spark
+        .readStream
+        .option("maxFilesPerTrigger", 1)
+        .text(src.getCanonicalPath)
+
+      def startTriggerOnceQuery(): StreamingQuery = {
+        // NOTE: the test uses the deprecated Trigger.Once() by intention, do not change.
+        df.writeStream
+          .foreachBatch((_: Dataset[Row], _: Long) => {})
+          .trigger(Trigger.Once)
+          .option("checkpointLocation", checkpoint)
+          .start()
+      }
+
+      // run a query with Trigger.Once first
+      val q = startTriggerOnceQuery()
+
+      try {
+        assert(q.awaitTermination(streamingTimeout.toMillis))
+      } finally {
+        q.stop()
+      }
+
+      // For queries with Trigger.AvailableNow, maxFilesPerTrigger option will be honored, so we
+      // will have a one-to-one mapping between rows and micro-batches.
+      // This variable tracks the number of rows / micro-batches starting from here.
+      // It starts from 3 since we have processed the first 3 rows in the first query.
+      var index = 3
+      def startTriggerAvailableNowQuery(): StreamingQuery = {
+        df.writeStream
+          .foreachBatch((df: Dataset[Row], _: Long) => {
+            index += 1
+            checkAnswer(df, Row(index.toString))
+          })
+          .trigger(Trigger.AvailableNow)
+          .option("checkpointLocation", checkpoint)
+          .start()
+      }
+
+      createFile(4)
+      createFile(5)
+
+      // run a second query with Trigger.AvailableNow
+      val q2 = startTriggerAvailableNowQuery()
+      try {
+        assert(q2.awaitTermination(streamingTimeout.toMillis))
+        assert(index == 5)
+      } finally {
+        q2.stop()
+      }
+
+      createFile(6)
+      createFile(7)
+
+      // run a third query with Trigger.AvailableNow
+      val q3 = startTriggerAvailableNowQuery()
+      try {
+        assert(q3.awaitTermination(streamingTimeout.toMillis))
+        assert(index == 7)
+      } finally {
+        q3.stop()
       }
     }
   }
@@ -1351,7 +1435,7 @@ class FileStreamSourceSuite extends FileStreamSourceTest {
 
     // This is to avoid running a spark job to list of files in parallel
     // by the InMemoryFileIndex.
-    spark.sessionState.conf.setConf(SQLConf.PARALLEL_PARTITION_DISCOVERY_THRESHOLD, numFiles * 2)
+    spark.conf.set(SQLConf.PARALLEL_PARTITION_DISCOVERY_THRESHOLD, numFiles * 2)
 
     withTempDirs { case (root, tmp) =>
       val src = new File(root, "a=1")
@@ -2250,7 +2334,7 @@ class FileStreamSourceSuite extends FileStreamSourceTest {
     ).foreach { schema =>
       withTempDir { dir =>
         val colName = "col"
-        val msg = "can only contain StringType as a key type for a MapType"
+        val msg = "can only contain STRING as a key type for a MAP"
 
         val thrown1 = intercept[AnalysisException](
           spark.readStream.schema(StructType(Seq(StructField(colName, schema))))

@@ -393,7 +393,7 @@ abstract class RDD[T: ClassTag](
         }
       // Need to compute the block.
       case Right(iter) =>
-        new InterruptibleIterator(context, iter.asInstanceOf[Iterator[T]])
+        new InterruptibleIterator(context, iter)
     }
   }
 
@@ -1211,7 +1211,22 @@ abstract class RDD[T: ClassTag](
       seqOp: (U, T) => U,
       combOp: (U, U) => U,
       depth: Int = 2): U = withScope {
-    require(depth >= 1, s"Depth must be greater than or equal to 1 but got $depth.")
+      treeAggregate(zeroValue, seqOp, combOp, depth, finalAggregateOnExecutor = false)
+  }
+
+  /**
+   * [[org.apache.spark.rdd.RDD#treeAggregate]] with a parameter to do the final
+   * aggregation on the executor
+   *
+   * @param finalAggregateOnExecutor do final aggregation on executor
+   */
+  def treeAggregate[U: ClassTag](
+      zeroValue: U,
+      seqOp: (U, T) => U,
+      combOp: (U, U) => U,
+      depth: Int,
+      finalAggregateOnExecutor: Boolean): U = withScope {
+      require(depth >= 1, s"Depth must be greater than or equal to 1 but got $depth.")
     if (partitions.length == 0) {
       Utils.clone(zeroValue, context.env.closureSerializer.newInstance())
     } else {
@@ -1232,6 +1247,15 @@ abstract class RDD[T: ClassTag](
         partiallyAggregated = partiallyAggregated.mapPartitionsWithIndex {
           (i, iter) => iter.map((i % curNumPartitions, _))
         }.foldByKey(zeroValue, new HashPartitioner(curNumPartitions))(cleanCombOp).values
+      }
+      if (finalAggregateOnExecutor && partiallyAggregated.partitions.length > 1) {
+        // map the partially aggregated rdd into a key-value rdd
+        // do the computation in the single executor with one partition
+        // get the new RDD[U]
+        partiallyAggregated = partiallyAggregated
+          .map(v => (0.toByte, v))
+          .foldByKey(zeroValue, new ConstantPartitioner)(cleanCombOp)
+          .values
       }
       val copiedZeroValue = Utils.clone(zeroValue, sc.env.closureSerializer.newInstance())
       partiallyAggregated.fold(copiedZeroValue)(cleanCombOp)
@@ -1716,7 +1740,6 @@ abstract class RDD[T: ClassTag](
   }
 
   /**
-   * :: Experimental ::
    * Removes an RDD's shuffles and it's non-persisted ancestors.
    * When running without a shuffle service, cleaning up shuffle files enables downscaling.
    * If you use the RDD after this call, you should checkpoint and materialize it first.
@@ -1725,7 +1748,6 @@ abstract class RDD[T: ClassTag](
    *   * Tuning the driver GC to be more aggressive, so the regular context cleaner is triggered
    *   * Setting an appropriate TTL for shuffle files to be auto cleaned
    */
-  @Experimental
   @DeveloperApi
   @Since("3.1.0")
   def cleanShuffleDependencies(blocking: Boolean = false): Unit = {
@@ -1734,9 +1756,11 @@ abstract class RDD[T: ClassTag](
        * Clean the shuffles & all of its parents.
        */
       def cleanEagerly(dep: Dependency[_]): Unit = {
-        if (dep.isInstanceOf[ShuffleDependency[_, _, _]]) {
-          val shuffleId = dep.asInstanceOf[ShuffleDependency[_, _, _]].shuffleId
-          cleaner.doCleanupShuffle(shuffleId, blocking)
+        dep match {
+          case dependency: ShuffleDependency[_, _, _] =>
+            val shuffleId = dependency.shuffleId
+            cleaner.doCleanupShuffle(shuffleId, blocking)
+          case _ => // do nothing
         }
         val rdd = dep.rdd
         val rddDepsOpt = rdd.internalDependencies
@@ -1786,7 +1810,7 @@ abstract class RDD[T: ClassTag](
    */
   @Experimental
   @Since("3.1.0")
-  def getResourceProfile(): ResourceProfile = resourceProfile.getOrElse(null)
+  def getResourceProfile(): ResourceProfile = resourceProfile.orNull
 
   // =======================================================================
   // Other internal methods and fields

@@ -22,14 +22,14 @@ import java.lang.Thread.UncaughtExceptionHandler
 import java.net.URL
 import java.nio.ByteBuffer
 import java.util.Properties
-import java.util.concurrent.{ConcurrentHashMap, CountDownLatch, TimeUnit}
+import java.util.concurrent.{CountDownLatch, TimeUnit}
 import java.util.concurrent.atomic.AtomicBoolean
 
 import scala.collection.immutable
 import scala.collection.mutable.{ArrayBuffer, Map}
 import scala.concurrent.duration._
 
-import com.github.benmanes.caffeine.cache.{CacheLoader, Caffeine}
+import com.google.common.cache.{CacheBuilder, CacheLoader}
 import org.mockito.ArgumentCaptor
 import org.mockito.ArgumentMatchers.{any, eq => meq}
 import org.mockito.Mockito.{inOrder, verify, when}
@@ -321,13 +321,7 @@ class ExecutorSuite extends SparkFunSuite
       nonZeroAccumulator.add(1)
       metrics.registerAccumulator(nonZeroAccumulator)
 
-      val executorClass = classOf[Executor]
-      val tasksMap = {
-        val field =
-          executorClass.getDeclaredField("org$apache$spark$executor$Executor$$runningTasks")
-        field.setAccessible(true)
-        field.get(executor).asInstanceOf[ConcurrentHashMap[Long, executor.TaskRunner]]
-      }
+      val tasksMap = executor.runningTasks
       val mockTaskRunner = mock[executor.TaskRunner]
       val mockTask = mock[Task[Any]]
       when(mockTask.metrics).thenReturn(metrics)
@@ -467,9 +461,9 @@ class ExecutorSuite extends SparkFunSuite
       }
     }
 
-    def errorInCaffeine(e: => Throwable): Throwable = {
-      val cache = Caffeine.newBuilder().build[String, String](
-        new CacheLoader[String, String] {
+    def errorInGuavaCache(e: => Throwable): Throwable = {
+      val cache = CacheBuilder.newBuilder()
+        .build(new CacheLoader[String, String] {
           override def load(key: String): String = throw e
         })
       intercept[Throwable] {
@@ -484,18 +478,18 @@ class ExecutorSuite extends SparkFunSuite
       import Executor.isFatalError
       // `e`'s depth is 1 so `depthToCheck` needs to be at least 3 to detect fatal errors.
       assert(isFatalError(e, depthToCheck) == (depthToCheck >= 1 && isFatal))
-      assert(isFatalError(errorInCaffeine(e), depthToCheck) == (depthToCheck >= 1 && isFatal))
       // `e`'s depth is 2 so `depthToCheck` needs to be at least 3 to detect fatal errors.
       assert(isFatalError(errorInThreadPool(e), depthToCheck) == (depthToCheck >= 2 && isFatal))
+      assert(isFatalError(errorInGuavaCache(e), depthToCheck) == (depthToCheck >= 2 && isFatal))
       assert(isFatalError(
         new SparkException("foo", e),
         depthToCheck) == (depthToCheck >= 2 && isFatal))
-      assert(isFatalError(
-        errorInThreadPool(errorInCaffeine(e)),
-        depthToCheck) == (depthToCheck >= 2 && isFatal))
       // `e`'s depth is 3 so `depthToCheck` needs to be at least 3 to detect fatal errors.
       assert(isFatalError(
-        errorInCaffeine(errorInThreadPool(e)),
+        errorInThreadPool(errorInGuavaCache(e)),
+        depthToCheck) == (depthToCheck >= 3 && isFatal))
+      assert(isFatalError(
+        errorInGuavaCache(errorInThreadPool(e)),
         depthToCheck) == (depthToCheck >= 3 && isFatal))
       assert(isFatalError(
         new SparkException("foo", new SparkException("foo", e)),
@@ -549,6 +543,7 @@ class ExecutorSuite extends SparkFunSuite
       stageAttemptId = 0,
       taskBinary = taskBinary,
       partition = rdd.partitions(0),
+      numPartitions = 1,
       locs = Seq(),
       outputId = 0,
       localProperties = new Properties(),

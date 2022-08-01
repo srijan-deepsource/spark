@@ -21,7 +21,14 @@ SELF=$(cd $(dirname $0) && pwd)
 . "$SELF/util.sh"
 
 if [ -z "${JAVA_HOME}" -a "$(command -v javac)" ]; then
-  export JAVA_HOME="$(dirname $(dirname $(realpath $(command -v javac))))"
+  if [ "$(uname -s)" = "Darwin" ]; then
+    # For some versions of macOS, "/usr/bin/javac" is a real file instead of a symbolic link,
+    # so the JAVA_HOME may be set to path "/usr" improperly.
+    # The following command is an appropriate way of setting JAVA_HOME on macOS.
+    export JAVA_HOME="$(/usr/libexec/java_home)"
+  else
+    export JAVA_HOME="$(dirname $(dirname $(realpath $(command -v javac))))"
+  fi
 fi
 
 # Determine the current working directory
@@ -172,6 +179,13 @@ cd "${_CALLING_DIR}"
 export MAVEN_OPTS=${MAVEN_OPTS:-"$_COMPILE_JVM_OPTS"}
 
 echo "Using \`mvn\` from path: $MVN_BIN" 1>&2
+
+if [ ! -z "${SPARK_LOCAL_HOSTNAME}" ]; then
+  echo "Using SPARK_LOCAL_HOSTNAME=$SPARK_LOCAL_HOSTNAME" 1>&2
+fi
+if [ ! -z "${SPARK_LOCAL_IP}" ]; then
+  echo "Using SPARK_LOCAL_IP=$SPARK_LOCAL_IP" 1>&2
+fi
 
 # call the `mvn` command as usual
 # SPARK-25854

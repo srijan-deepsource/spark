@@ -20,9 +20,10 @@ import java.time.Instant
 import java.util.concurrent.atomic.AtomicInteger
 
 import scala.collection.JavaConverters._
+import scala.collection.mutable
 
 import io.fabric8.kubernetes.api.model._
-import io.fabric8.kubernetes.client.KubernetesClient
+import io.fabric8.kubernetes.client.{KubernetesClient, KubernetesClientException}
 import io.fabric8.kubernetes.client.dsl.PodResource
 import org.mockito.{Mock, MockitoAnnotations}
 import org.mockito.ArgumentMatchers.{any, eq => meq}
@@ -101,6 +102,8 @@ class ExecutorPodsAllocatorSuite extends SparkFunSuite with BeforeAndAfter {
 
   private var podsAllocatorUnderTest: ExecutorPodsAllocator = _
 
+  val appId = "testapp"
+
   before {
     MockitoAnnotations.openMocks(this).close()
     when(kubernetesClient.pods()).thenReturn(podOperations)
@@ -115,6 +118,10 @@ class ExecutorPodsAllocatorSuite extends SparkFunSuite with BeforeAndAfter {
       conf, secMgr, executorBuilder, kubernetesClient, snapshotsStore, waitForExecutorPodsClock)
     when(schedulerBackend.getExecutorIds).thenReturn(Seq.empty)
     podsAllocatorUnderTest.start(TEST_SPARK_APP_ID, schedulerBackend)
+    when(kubernetesClient.persistentVolumeClaims()).thenReturn(persistentVolumeClaims)
+    when(persistentVolumeClaims.withLabel(any(), any())).thenReturn(labeledPersistentVolumeClaims)
+    when(labeledPersistentVolumeClaims.list()).thenReturn(persistentVolumeClaimList)
+    when(persistentVolumeClaimList.getItems).thenReturn(Seq.empty[PersistentVolumeClaim].asJava)
   }
 
   test("SPARK-36052: test splitSlots") {
@@ -209,7 +216,8 @@ class ExecutorPodsAllocatorSuite extends SparkFunSuite with BeforeAndAfter {
     val counter = PrivateMethod[AtomicInteger](Symbol("EXECUTOR_ID_COUNTER"))()
     assert(podsAllocatorUnderTest.invokePrivate(counter).get() === 0)
 
-    podsAllocatorUnderTest.setTotalExpectedExecutors(Map(defaultProfile -> (podAllocationSize + 1)))
+    podsAllocatorUnderTest.setTotalExpectedExecutors(
+      Map(defaultProfile -> (podAllocationSize + 1)))
     assert(podsAllocatorUnderTest.numOutstandingPods.get() == 5)
     for (execId <- 1 until podAllocationSize) {
       snapshotsStore.updatePod(runningExecutor(execId))
@@ -230,7 +238,8 @@ class ExecutorPodsAllocatorSuite extends SparkFunSuite with BeforeAndAfter {
 
   test("When a current batch reaches error states immediately, re-request" +
     " them on the next batch.") {
-    podsAllocatorUnderTest.setTotalExpectedExecutors(Map(defaultProfile -> podAllocationSize))
+    podsAllocatorUnderTest.setTotalExpectedExecutors(
+      Map(defaultProfile -> podAllocationSize))
     assert(podsAllocatorUnderTest.numOutstandingPods.get() == 5)
     for (execId <- 1 until podAllocationSize) {
       snapshotsStore.updatePod(runningExecutor(execId))
@@ -240,6 +249,17 @@ class ExecutorPodsAllocatorSuite extends SparkFunSuite with BeforeAndAfter {
     snapshotsStore.notifySubscribers()
     assert(podsAllocatorUnderTest.numOutstandingPods.get() == 1)
     verify(podOperations).create(podWithAttachedContainerForId(podAllocationSize + 1))
+  }
+
+  test("Verify stopping deletes the labeled pods") {
+    when(podOperations
+      .withLabel(SPARK_APP_ID_LABEL, TEST_SPARK_APP_ID))
+      .thenReturn(podOperations)
+    when(podOperations
+      .withLabel(SPARK_ROLE_LABEL, SPARK_POD_EXECUTOR_ROLE))
+      .thenReturn(labeledPods)
+    podsAllocatorUnderTest.stop(TEST_SPARK_APP_ID)
+    verify(labeledPods).delete()
   }
 
   test("When an executor is requested but the API does not report it in a reasonable time, retry" +
@@ -253,7 +273,8 @@ class ExecutorPodsAllocatorSuite extends SparkFunSuite with BeforeAndAfter {
     when(podOperations
       .withLabelIn(SPARK_EXECUTOR_ID_LABEL, "1"))
       .thenReturn(labeledPods)
-    podsAllocatorUnderTest.setTotalExpectedExecutors(Map(defaultProfile -> 1))
+    podsAllocatorUnderTest.setTotalExpectedExecutors(
+      Map(defaultProfile -> 1))
     assert(podsAllocatorUnderTest.numOutstandingPods.get() == 1)
     verify(podOperations).create(podWithAttachedContainerForId(1))
     waitForExecutorPodsClock.setTime(podCreationTimeout + 1)
@@ -281,7 +302,8 @@ class ExecutorPodsAllocatorSuite extends SparkFunSuite with BeforeAndAfter {
     waitForExecutorPodsClock.setTime(startTime)
 
     // Target 1 executor, make sure it's requested, even with an empty initial snapshot.
-    podsAllocatorUnderTest.setTotalExpectedExecutors(Map(defaultProfile -> 1))
+    podsAllocatorUnderTest.setTotalExpectedExecutors(
+      Map(defaultProfile -> 1))
     assert(podsAllocatorUnderTest.numOutstandingPods.get() == 1)
     verify(podOperations).create(podWithAttachedContainerForId(1))
 
@@ -293,7 +315,8 @@ class ExecutorPodsAllocatorSuite extends SparkFunSuite with BeforeAndAfter {
     verify(podOperations, never()).delete()
 
     // Request 3 more executors, make sure all are requested.
-    podsAllocatorUnderTest.setTotalExpectedExecutors(Map(defaultProfile -> 4))
+    podsAllocatorUnderTest.setTotalExpectedExecutors(
+      Map(defaultProfile -> 4))
     snapshotsStore.notifySubscribers()
     assert(podsAllocatorUnderTest.numOutstandingPods.get() == 3)
     verify(podOperations).create(podWithAttachedContainerForId(2))
@@ -310,7 +333,8 @@ class ExecutorPodsAllocatorSuite extends SparkFunSuite with BeforeAndAfter {
 
     // Scale down to 1. Pending executors (both acknowledged and not) should be deleted.
     waitForExecutorPodsClock.advance(executorIdleTimeout * 2)
-    podsAllocatorUnderTest.setTotalExpectedExecutors(Map(defaultProfile -> 1))
+    podsAllocatorUnderTest.setTotalExpectedExecutors(
+      Map(defaultProfile -> 1))
     snapshotsStore.notifySubscribers()
     assert(podsAllocatorUnderTest.numOutstandingPods.get() == 0)
     verify(podOperations, times(4)).create(any())
@@ -675,9 +699,6 @@ class ExecutorPodsAllocatorSuite extends SparkFunSuite with BeforeAndAfter {
       .set(s"$prefix.option.sizeLimit", "200Gi")
       .set(s"$prefix.option.storageClass", "gp2")
 
-    when(kubernetesClient.persistentVolumeClaims()).thenReturn(persistentVolumeClaims)
-    when(persistentVolumeClaims.withLabel(any(), any())).thenReturn(labeledPersistentVolumeClaims)
-    when(labeledPersistentVolumeClaims.list()).thenReturn(persistentVolumeClaimList)
     when(persistentVolumeClaimList.getItems)
       .thenReturn(Seq(persistentVolumeClaim("pvc-0", "gp2", "200Gi")).asJava)
     when(executorBuilder.buildFromFeatures(any(classOf[KubernetesExecutorConf]), meq(secMgr),
@@ -740,6 +761,13 @@ class ExecutorPodsAllocatorSuite extends SparkFunSuite with BeforeAndAfter {
       conf, secMgr, executorBuilder, kubernetesClient, snapshotsStore, waitForExecutorPodsClock))
     assert(e.getMessage.contains("No pod was found named i-do-not-exist in the cluster in the" +
       " namespace default"))
+  }
+
+  test("SPARK-39688: getReusablePVCs should handle accounts with no PVC permission") {
+    val getReusablePVCs =
+      PrivateMethod[mutable.Buffer[PersistentVolumeClaim]](Symbol("getReusablePVCs"))
+    when(persistentVolumeClaimList.getItems).thenThrow(new KubernetesClientException("Error"))
+    podsAllocatorUnderTest invokePrivate getReusablePVCs("appId", Seq.empty[String])
   }
 
   private def executorPodAnswer(): Answer[KubernetesExecutorSpec] =

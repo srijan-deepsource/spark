@@ -25,8 +25,6 @@ import com.google.common.base.Throwables;
 import org.apache.spark.annotation.Evolving;
 import org.apache.spark.network.server.BlockPushNonFatalFailure;
 
-import static org.apache.spark.network.server.BlockPushNonFatalFailure.ReturnCode.*;
-
 /**
  * Plugs into {@link RetryingBlockTransferor} to further control when an exception should be retried
  * and logged.
@@ -82,15 +80,16 @@ public interface ErrorHandler {
       // If it is a FileNotFoundException originating from the client while pushing the shuffle
       // blocks to the server, even then there is no need to retry. We will still log this
       // exception once which helps with debugging.
-      if (t.getCause() != null && (t.getCause() instanceof ConnectException ||
-          t.getCause() instanceof FileNotFoundException)) {
+      if (t.getCause() instanceof ConnectException ||
+          t.getCause() instanceof FileNotFoundException) {
         return false;
       }
 
-      // If the block is too late or stale block push, there is no need to retry it
+      // If the block is too late or the invalid block push or the attempt is not the latest one,
+      // there is no need to retry it
       return !(t instanceof BlockPushNonFatalFailure &&
-        (((BlockPushNonFatalFailure) t).getReturnCode() == TOO_LATE_BLOCK_PUSH ||
-          ((BlockPushNonFatalFailure) t).getReturnCode() == STALE_BLOCK_PUSH));
+        BlockPushNonFatalFailure
+          .shouldNotRetryErrorCode(((BlockPushNonFatalFailure) t).getReturnCode()));
     }
 
     @Override
